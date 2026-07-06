@@ -166,8 +166,3 @@ This framework is intended for legitimate security research, penetration testing
 - Tartarus Gate: [@TheRealWover](https://twitter.com/TheRealWover)
 - Indirect Syscall: [@Cneelis](https://twitter.com/Cneelis)
 - Various contributions from the malware analysis and offensive security community
-
----
-
-**Version**: 1.0  
-**Last Updated**: November 2023
